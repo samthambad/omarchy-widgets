@@ -1,0 +1,665 @@
+widget "Spreedy" {
+  size: 6x3
+  minSize: 4x2
+  padding: 12
+  meta { owl: 10; description: "One-word speed reader for EPUB and text files, with reachable transport controls, chapters, a text view and a bookmark per book."; version: "2.0"; license: "MIT"; category: "productivity" }
+  requires { pacman: ["python"] }
+
+  state path = "" persist
+  state draft = ""
+  state wpm = 300 persist
+  // Words read in one flash; the clock still moves a word at a time.
+  state groupSize = 1 persist
+  state skipSeconds = 5 persist
+  // Where reading is when paused. `origin` and `started` drive the word while playing.
+  state bookmark = 0 persist
+  // A bookmark per file, so a second book doesn't inherit the first one's place.
+  state marks = {} persist
+  state chunk = floor(bookmark / 600)
+  state playing = false
+  state origin = 0
+  state started = 0
+  state endsAt = 0
+  state resume = false
+  state lastSeen = 0
+  state view = "read"
+  state page = 0
+
+  // Offline default: Lewis Carroll, Alice's Adventures in Wonderland, Chapter I.
+  // Source: https://www.gutenberg.org/files/11/11-h/11-h.htm
+  let reader = """
+import sys,json,pathlib,zipfile,posixpath,re,zlib,base64
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from urllib.parse import unquote
+
+def tokenize(text):
+ slash=chr(92)
+ return re.sub(f"(?<=[^{slash}W_])(?:[^{slash}w{slash}s]|_)+(?=[^{slash}W_])", " ", text).split()
+
+class Text(HTMLParser):
+ def __init__(self): super().__init__(); self.parts=[]; self.size=0; self.skip=0; self.anchors={}
+ def handle_starttag(self,t,a):
+  if t in ('script','style'): self.skip+=1
+  if t in ('p','div','br','li','h1','h2','h3','h4','tr','td'): self.parts.append(' '); self.size+=1
+  for k,v in a:
+   if k in ('id','name') and v and v not in self.anchors: self.anchors[v]=self.size
+ def handle_endtag(self,t):
+  if t in ('script','style'): self.skip=max(0,self.skip-1)
+  self.parts.append(' '); self.size+=1
+ def handle_data(self,s):
+  if not self.skip: self.parts.append(s); self.size+=len(s)
+
+def html_text(data):
+ p=Text(); p.feed(data); return ''.join(p.parts),p.anchors
+
+def anchor_words(body,marks):
+ # Word offset of each id: tokenize the gaps once, not the whole prefix each time.
+ out={}; prev=0; count=0
+ for name,pos in sorted(marks.items(),key=lambda kv:kv[1]):
+  count+=len(tokenize(body[prev:pos])); prev=pos; out[name]=count
+ return out
+
+def metadata(root):
+ title=author=''
+ for e in root.iter():
+  if e.tag.endswith('}title') and not title and e.text: title=' '.join(e.text.split())
+  if e.tag.endswith('}creator') and not author and e.text: author=' '.join(e.text.split())
+ return title,author
+
+def read_epub(path):
+ with zipfile.ZipFile(path) as z:
+  container=ET.fromstring(z.read('META-INF/container.xml'))
+  opf=next(e.attrib['full-path'] for e in container.iter() if e.tag.endswith('rootfile'))
+  root=ET.fromstring(z.read(opf)); base=posixpath.dirname(opf)
+  items={e.attrib['id']:e.attrib for e in root.iter() if e.tag.endswith('}item')}
+  def resolve(href,at):
+   return posixpath.normpath(posixpath.join(at,unquote(href.split('#')[0])))
+  title,author=metadata(root)
+  sections=[]
+  for e in root.iter():
+   if e.tag.endswith('}itemref') and e.attrib.get('linear','yes')!='no':
+    item=items.get(e.attrib['idref'])
+    if item and item.get('media-type') in ('application/xhtml+xml','text/html'):
+     href=resolve(item['href'],base)
+     body,anchors=html_text(z.read(href).decode('utf-8-sig',errors='replace'))
+     sections.append((href,body,anchors))
+  nav=next((i for i in items.values() if 'nav' in (i.get('properties') or '').split()),None)
+  toc=[]
+  def add(name,href,at):
+   if not name or not href or href.startswith(('http:','https:','mailto:','#')): return
+   name=' '.join(name.split())
+   path,frag=(href.split('#',1)+[''])[:2] if '#' in href else (href,'')
+   # Links are relative to the document that holds them; a few books get this wrong.
+   for where in (resolve(path,at),resolve(path,base)):
+    if (name,where,frag) not in toc: toc.append((name,where,frag))
+  if nav:
+   try:
+    navpath=resolve(nav['href'],base)
+    doc=ET.fromstring(z.read(navpath))
+    navdir=posixpath.dirname(navpath)
+    navs=[n for n in doc.iter() if n.tag.endswith('}nav')]
+    # The table of contents is one of the navs; a page list would give page numbers.
+    picked=[n for n in navs if 'toc' in (n.attrib.get('{http://www.idpf.org/2007/ops}type') or n.attrib.get('type') or '').split()]
+    chosen=picked[0] if picked else (navs[0] if navs else doc)
+    for a in chosen.iter():
+     if a.tag.endswith('}a'): add(a.text or '',a.attrib.get('href',''),navdir)
+   except Exception: pass
+  if not toc:
+   spine=next((e for e in root.iter() if e.tag.endswith('}spine')),None)
+   ncx=items.get(spine.attrib.get('toc','')) if spine is not None else None
+   if ncx is None:
+    ncx=next((i for i in items.values() if i.get('media-type')=='application/x-dtbncx+xml'),None)
+   if ncx:
+    try:
+     ncxpath=resolve(ncx['href'],base)
+     doc=ET.fromstring(z.read(ncxpath))
+     ncxdir=posixpath.dirname(ncxpath)
+     for n in doc.iter():
+      if n.tag.endswith('}navPoint'):
+       label=next((e.text for e in n.iter() if e.tag.endswith('}text') and (e.text or '').strip()),None)
+       src=next((e.attrib.get('src') for e in n.iter() if e.tag.endswith('}content')),None)
+       if label and src: add(label,src,ncxdir)
+    except Exception: pass
+  return title,author,sections,toc
+
+def read_book(path):
+ if not path:
+  data=zlib.decompress(base64.b64decode('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')).decode('utf-8',errors='replace')
+  return "Alice's Adventures in Wonderland","Lewis Carroll",tokenize(data),[("Down the Rabbit-Hole",0)]
+ p=pathlib.Path(path).expanduser()
+ if p.suffix.lower()=='.epub':
+  title,author,sections,toc=read_epub(p)
+  words=[]; starts={}; anchors={}
+  for href,body,marks in sections:
+   starts.setdefault(href,len(words))
+   anchors[href]=anchor_words(body,marks)
+   words.extend(tokenize(body))
+  chapters=[]
+  for name,href,frag in toc:
+   if href in starts: chapters.append((name,starts[href]+anchors.get(href,{}).get(frag,0)))
+  return title or p.stem,author,words,chapters
+ if p.suffix.lower() not in ('.txt','.text','.md','.markdown'): raise ValueError('Choose an .epub or .txt file')
+ raw=p.read_bytes()
+ text=raw.decode('utf-16' if raw[:2] in (b'\\xff\\xfe',b'\\xfe\\xff') else 'utf-8-sig',errors='replace')
+ words=[]; chapters=[]; markdown=p.suffix.lower() in ('.md','.markdown')
+ for line in text.splitlines():
+  if markdown and re.match(r'^#{1,3} +\\S',line.strip()):
+   chapters.append((re.sub(r'^#+ *','',line.strip()),len(words)))
+  words.extend(tokenize(line))
+ return p.stem,'',words,chapters
+
+try:
+ offset=max(0,int(sys.argv[2]))*600
+ title,author,words,chapters=read_book(sys.argv[1])
+ if not words: raise ValueError('No readable text found')
+ out=[]; last=-1
+ for name,index in sorted(chapters,key=lambda c:c[1]):
+  if 0<=index<len(words) and index>last:
+   out.append(dict(name=name,word=index)); last=index
+  if len(out)>=200: break
+ print(json.dumps(dict(path=sys.argv[1],words=words[offset:offset+600],total=len(words),title=title,author=author,chunk=offset//600,before=words[offset-1] if offset>0 and offset<=len(words) else "",after=words[offset+600] if offset+600<len(words) else "",chapters=out)))
+except Exception as e: print(json.dumps(dict(path=sys.argv[1] if len(sys.argv)>1 else "",error=str(e),words=[],total=0,title='Unable to load',author='',chunk=0,chapters=[])))
+"""
+
+  source now = clock every 1s
+  source book = cmd("python -c " + sh(reader) + " " + sh(path) + " " + sh(chunk)) every 1h json
+
+  let total = book.total ?? 0
+  let ready = book != null && book.path == path && book.chunk == chunk && len(book.words) > 0
+  let chapters = book.chapters ?? []
+  let title = book.title ?? "Spreedy"
+  // Last word this chunk can show, and the word the next chunk starts at.
+  let limit = min(total - 1, chunk * 600 + 599)
+  let boundary = min(total - 1, (chunk + 1) * 600)
+  let local = bookmark - chunk * 600
+  let group = clamp(groupSize, 1, 5)
+  let skipWords = max(1, round(wpm * skipSeconds / 60))
+  let percent = total > 0 ? (bookmark + 1) / total * 100 : 0
+  let current = last(chapters.filter(c => c.word <= bookmark))
+  let chapterName = current != null ? current.name : title
+
+  // `time` is the animation clock, seconds since the widget loaded, and drives the
+  // word; `now` is Unix time, and is the only clock a deadline may use. This tick
+  // also notices when the page was left: `now` stops while the widget isn't live,
+  // so a jump of more than two seconds rewinds to the word last seen, then pauses.
+  on now {
+    let away = lastSeen > 0 ? value - lastSeen : 0
+    if playing && away > 2 {
+      // The page was left: keep the last word synced below, then stop.
+      playing = false
+      endsAt = 0
+      marks = set(marks, path, bookmark)
+    } else if playing {
+      // Keep the bookmark on the word actually showing, once a second.
+      bookmark = min(limit, origin + floor(max(0, time - started) * wpm / 60))
+      if num(endsAt, 0) <= 0 {
+        endsAt = value + max(0, boundary - bookmark) * 60 / wpm
+      } else if value >= endsAt {
+        bookmark = min(total - 1, boundary)
+        playing = false
+        endsAt = 0
+        marks = set(marks, path, bookmark)
+        if bookmark < total - 1 {
+          resume = true
+          chunk = floor(bookmark / 600)
+          refresh()
+        } else {
+          resume = false
+        }
+      }
+    }
+    lastSeen = value
+  }
+
+  // The next chunk is in: carry on from the word that ended the last one.
+  on book {
+    if resume && ready {
+      origin = bookmark
+      started = time
+      playing = true
+      lastSeen = now != null ? now : lastSeen
+      endsAt = now != null ? now + max(0, boundary - bookmark) * 60 / wpm : 0
+    }
+    resume = false
+  }
+
+  // Jumped to another chunk (a chapter, the text view, the slider): load it.
+  when !playing && chunk != floor(bookmark / 600) {
+    chunk = floor(bookmark / 600)
+    refresh()
+  }
+
+  // A smaller book after a bigger one, or a mark past the end.
+  when ready && !playing && bookmark > total - 1 {
+    bookmark = max(0, total - 1)
+  }
+
+  // Looking at chapters or text pauses reading, so nothing moves under the eyes.
+  when view != "read" && playing {
+    bookmark = min(limit, origin + floor(max(0, time - started) * wpm / 60))
+    playing = false
+    endsAt = 0
+    marks = set(marks, path, bookmark)
+  }
+
+  component PlayButton() {
+    Button {
+      text: playing ? "❚❚" : "▶"
+      onTap: {
+        if playing {
+          bookmark = min(limit, origin + floor(max(0, time - started) * wpm / 60))
+          playing = false
+          endsAt = 0
+          marks = set(marks, path, bookmark)
+        } else if ready {
+          origin = bookmark
+          started = time
+          playing = true
+          lastSeen = now != null ? now : lastSeen
+          endsAt = now != null ? now + max(0, boundary - bookmark) * 60 / wpm : 0
+        }
+      }
+    }
+  }
+
+  component SkipButton(dir = 1) {
+    Button {
+      text: dir < 0 ? "−${skipSeconds}s" : "+${skipSeconds}s"
+      onTap: {
+        let was = playing && ready
+        let from = was ? min(limit, origin + floor(max(0, time - started) * wpm / 60)) : bookmark
+        let target = clamp(from + dir * skipWords, 0, max(0, total - 1))
+        playing = false
+        endsAt = 0
+        bookmark = target
+        marks = set(marks, path, target)
+        if floor(target / 600) != chunk {
+          resume = was
+          chunk = floor(target / 600)
+          refresh()
+        } else if was && target < total - 1 {
+          origin = target
+          started = time
+          playing = true
+          lastSeen = now != null ? now : lastSeen
+          endsAt = now != null ? now + max(0, boundary - target) * 60 / wpm : 0
+        }
+      }
+    }
+  }
+
+  component ChapterStep(dir = 1) {
+    Button {
+      text: dir < 0 ? "⏮" : "⏭"
+      onTap: {
+        let here = playing && ready ? min(limit, origin + floor(max(0, time - started) * wpm / 60)) : bookmark
+        let index = len(chapters.filter(c => c.word <= here)) - 1
+        let target = dir < 0 ? (index > 0 ? chapters[index - 1].word : 0) : (index + 1 < len(chapters) ? chapters[index + 1].word : total - 1)
+        playing = false
+        endsAt = 0
+        resume = false
+        bookmark = clamp(target, 0, max(0, total - 1))
+        marks = set(marks, path, bookmark)
+        chunk = floor(bookmark / 600)
+        refresh()
+      }
+    }
+  }
+
+  component Tab(target = "read", label = "") {
+    Button {
+      text: label
+      color: view == target ? accent : null
+      onTap: view = target
+    }
+  }
+
+  component WordDrawing(animated = false) {
+    Canvas {
+      fill: true
+      let lastIndex = min(total - 1, chunk * 600 + 599)
+      let position = animated ? min(lastIndex, origin + floor(max(0, time - started) * wpm / 60)) : bookmark
+      let offset = position - chunk * 600
+      // "Words at once" reads a phrase per flash; the clock still advances a word at a time.
+      let first = max(0, offset - offset % group)
+      let phrase = ready && offset >= 0 && offset < len(book.words) ? join(book.words.drop(first).take(group), " ") : "…"
+      // Focus moves toward the first third as words grow; opening punctuation is skipped.
+      let opening = startsWith(phrase, "“") || startsWith(phrase, "\"") || startsWith(phrase, "'") || startsWith(phrase, "(") ? 1 : 0
+      let letters = max(1, len(phrase) - opening)
+      let focus = min(len(phrase) - 1, opening + (letters <= 1 ? 0 : letters <= 5 ? 1 : letters <= 9 ? 2 : letters <= 13 ? 3 : 4))
+      let previousWord = group == 1 && ready ? (offset > 0 ? (book.words[offset - 1] ?? "") : (book.before ?? "")) : ""
+      let nextWord = group == 1 && ready ? (book.words[offset + 1] ?? book.after ?? "") : ""
+      let shown = len(phrase) > 80 ? sub(phrase, 0, 79) + "…" : phrase
+      let anchor = width * 0.42
+      let font = min(96, height * 0.4, min((anchor - 12) / max(1, focus + 0.5), (width - anchor - 12) / max(1, len(shown) - focus - 0.5)) / 0.61)
+      let advance = font * 0.61
+      let middle = height / 2
+      let gap = font * 0.85
+      let wordLeft = anchor - (focus + 0.5) * advance
+      let wordRight = anchor + (len(shown) - focus - 0.5) * advance
+      // Context shares the reading line; overflow disappears at the edges.
+      clip(12, 0, max(0, width - 24), height) {
+        text(previousWord, wordLeft - advance, middle, size: font * 0.55, align: end, color: alpha(muted, 0.55), bold: true)
+        text(nextWord, wordRight + advance, middle, size: font * 0.55, align: start, color: alpha(muted, 0.55), bold: true)
+      }
+      // A stable target above and below the focus character, away from the word.
+      line(12, middle - gap - 8, width - 12, middle - gap - 8, stroke: alpha(muted, 0.25), width: 1)
+      line(12, middle + gap + 8, width - 12, middle + gap + 8, stroke: alpha(muted, 0.25), width: 1)
+      line(anchor, middle - gap - 8, anchor, middle - gap, stroke: accent, width: 2)
+      line(anchor, middle + gap, anchor, middle + gap + 8, stroke: accent, width: 2)
+      for i in range(len(shown)) {
+        text(sub(shown, i, i + 1), anchor + (i - focus) * advance, middle, size: font, align: center, color: i == focus ? accent : foreground, bold: true)
+      }
+      line(anchor - advance * 0.42, middle + font * 0.65, anchor + advance * 0.42, middle + font * 0.65, stroke: accent, width: 2, cap: round)
+    }
+  }
+
+  // The tile: chapter and progress, the word, then the transport.
+  Column {
+    fill: true; gap: 6
+    Row {
+      fill: width; align: center; gap: 8
+      Text { text: chapterName; style: label; color: muted; weight: 1; maxLines: 1 }
+      Text { text: "${round(percent)}%"; style: label; color: muted; maxLines: 1 }
+      Button { text: "⚙"; onTap: { view = "settings"; screen() } }
+    }
+    Box {
+      weight: 1; fill: width; align: center
+      onTap: {
+        if playing {
+          bookmark = min(limit, origin + floor(max(0, time - started) * wpm / 60))
+          playing = false
+          endsAt = 0
+          marks = set(marks, path, bookmark)
+        } else if ready {
+          origin = bookmark
+          started = time
+          playing = true
+          endsAt = now != null ? now + max(0, boundary - bookmark) * 60 / wpm : 0
+        }
+      }
+      if book.error {
+        Text { text: book.error; fontSize: 16; align: center; maxLines: 3; color: red; fill: width }
+      } else {
+        WordDrawing { animated: playing && ready }
+      }
+    }
+    Row {
+      fill: width; align: center; gap: 8
+      PlayButton { }
+      SkipButton { dir: -1 }
+      SkipButton { dir: 1 }
+      Text { text: "${wpm} wpm"; style: label; color: muted; align: end; weight: 1; maxLines: 1 }
+    }
+    Canvas {
+      fill: width; height: 16
+      let position = playing && ready ? min(limit, origin + floor(max(0, time - started) * wpm / 60)) : bookmark
+      let percent = total > 0 ? (position + 1) / total * 100 : 0
+      let labelWidth = min(230, width * 0.62)
+      let trackWidth = max(0, width - labelWidth - 10)
+      rect(0, height / 2 - 1.5, trackWidth, 3, fill: surface)
+      rect(0, height / 2 - 1.5, trackWidth * percent / 100, 3, fill: accent)
+      text("${min(position + 1, total)} / ${fmtNum(total)} words · ${round(percent)}%", width, height / 2, size: width < 350 ? 10 : 12, align: end, color: muted)
+    }
+  }
+
+  screen {
+    title: "Spreedy"
+    Column {
+      fill: true; gap: 12
+      if view == "read" {
+        Column {
+          weight: 1; fill: width; gap: 12
+          Row {
+            fill: width; align: bottom
+            Column {
+              weight: 1; gap: 2
+              Text { text: title; style: body; maxLines: 1 }
+              Text { text: book.author ?? ""; style: muted; maxLines: 1 }
+            }
+            Text { text: "${round(percent)}%"; style: muted; maxLines: 1 }
+          }
+          Box {
+            weight: 1; fill: width; align: center
+            onTap: {
+              if playing {
+                bookmark = min(limit, origin + floor(max(0, time - started) * wpm / 60))
+                playing = false
+                endsAt = 0
+                marks = set(marks, path, bookmark)
+              } else if ready {
+                origin = bookmark
+                started = time
+                playing = true
+                lastSeen = now != null ? now : lastSeen
+                endsAt = now != null ? now + max(0, boundary - bookmark) * 60 / wpm : 0
+              }
+            }
+            if book.error {
+              Text { text: book.error; fontSize: 22; align: center; maxLines: 4; color: red; fill: width }
+            } else {
+              WordDrawing { animated: playing && ready }
+            }
+          }
+          Text { text: chapterName; style: small; color: accent; maxLines: 1 }
+          Canvas {
+            fill: width; height: 18
+            let position = playing && ready ? min(limit, origin + floor(max(0, time - started) * wpm / 60)) : bookmark
+            let percent = total > 0 ? (position + 1) / total * 100 : 0
+            let labelWidth = min(280, width * 0.62)
+            let trackWidth = max(0, width - labelWidth - 10)
+            rect(0, height / 2 - 1.5, trackWidth, 3, fill: surface)
+            rect(0, height / 2 - 1.5, trackWidth * percent / 100, 3, fill: accent)
+            text("${min(position + 1, total)} / ${fmtNum(total)} words · ${round(percent)}%", width, height / 2, size: 13, align: end, color: muted)
+          }
+          Row {
+            gap: 10; align: center; justify: center
+            if len(chapters) > 0 { ChapterStep { dir: -1 } }
+            SkipButton { dir: -1 }
+            PlayButton { }
+            SkipButton { dir: 1 }
+            if len(chapters) > 0 { ChapterStep { dir: 1 } }
+          }
+        }
+      }
+      if view == "text" {
+        Column {
+          weight: 1; fill: width; gap: 12
+          Row {
+            fill: width; align: bottom
+            Column {
+              weight: 1; gap: 2
+              Text { text: "Text"; style: title }
+              Text { text: title; style: muted; maxLines: 1 }
+            }
+            Text { text: "${page + 1} / 3"; style: muted }
+          }
+          let pageStart = clamp(page, 0, 2) * 240
+          let passage = ready ? book.words.drop(pageStart).take(240) : []
+          Flow {
+            weight: 1; fill: width; gap: 4; align: start
+            for entry, i in passage {
+              Text {
+                text: entry
+                font: mono; fontSize: 18; maxLines: 1
+                padding: [2, 3]
+                color: chunk * 600 + pageStart + i == bookmark ? background : alpha(foreground, 0.85)
+                background: chunk * 600 + pageStart + i == bookmark ? accent : alpha(surface, 0)
+                onTap: {
+                  bookmark = clamp(chunk * 600 + pageStart + i, 0, max(0, total - 1))
+                  playing = false
+                  endsAt = 0
+                  resume = false
+                  marks = set(marks, path, bookmark)
+                  view = "read"
+                }
+              }
+            }
+          }
+          Row {
+            gap: 8; align: center; justify: center
+            Button { text: "‹ earlier"; onTap: page = max(0, page - 1) }
+            Button { text: "later ›"; onTap: page = min(2, page + 1) }
+          }
+        }
+      }
+      if view == "chapters" {
+        Column {
+          weight: 1; fill: width; gap: 8
+          Row {
+            fill: width; align: bottom
+            Text { text: "Chapters"; style: title; weight: 1 }
+            Text { text: len(chapters) == 1 ? "1 chapter" : "${len(chapters)} chapters"; style: muted }
+          }
+          Column {
+            weight: 1; fill: width; scroll: true; gap: 2
+            if len(chapters) == 0 {
+              Text { text: "This file has no chapter marks. Use the word and text views."; style: muted; maxLines: 3 }
+            }
+            for entry, i in chapters {
+              Row {
+                fill: width; gap: 8; align: center; padding: [8, 12]
+                background: entry == current ? alpha(accent, 0.16) : alpha(surface, 0)
+                Text { text: entry.name; style: small; weight: 1; maxLines: 1; color: entry == current ? accent : foreground }
+                Text { text: "${round(entry.word / max(1, total) * 100)}%"; style: label; color: muted }
+                onTap: {
+                  bookmark = clamp(entry.word, 0, max(0, total - 1))
+                  playing = false
+                  endsAt = 0
+                  resume = false
+                  marks = set(marks, path, bookmark)
+                  chunk = floor(bookmark / 600)
+                  refresh()
+                  view = "read"
+                }
+              }
+            }
+          }
+        }
+      }
+      if view == "settings" {
+        Column {
+          weight: 1; fill: width; gap: 14; scroll: true
+          Text { text: "Reading"; style: title }
+          Text { text: "${wpm} words per minute"; style: body }
+          Slider { value: wpm; min: 60; max: 1000; step: 10; onChange: wpm = value }
+          Text { text: group == 1 ? "1 word at once" : "${group} words at once"; style: body }
+          Slider { value: groupSize; min: 1; max: 5; step: 1; onChange: groupSize = value }
+          Text { text: "Skip ${skipSeconds} seconds · ${skipWords} words"; style: body }
+          Slider { value: skipSeconds; min: 1; max: 60; step: 1; onChange: skipSeconds = value }
+          Row {
+            gap: 8
+            Button {
+              text: "Restart book"
+              onTap: {
+                bookmark = 0
+                chunk = 0
+                playing = false
+                endsAt = 0
+                resume = false
+                marks = set(marks, path, 0)
+                view = "read"
+                refresh()
+              }
+            }
+            Button { text: "Read"; onTap: view = "read" }
+          }
+          if total > 0 {
+            Text { text: "Jump to ${fmtNum(bookmark + 1)} of ${fmtNum(total)}"; style: label }
+            Slider {
+              value: bookmark; min: 0; max: max(1, total - 1); step: 1
+              onChange: {
+                bookmark = round(value)
+                playing = false
+                endsAt = 0
+                resume = false
+                marks = set(marks, path, bookmark)
+                if floor(bookmark / 600) != chunk {
+                  chunk = floor(bookmark / 600)
+                  refresh()
+                }
+              }
+            }
+          }
+          Text { text: "Book file"; style: label }
+          Input {
+            text: path
+            placeholder: "/root/Downloads/book.epub"
+            onChange: draft = value
+            onSubmit: {
+              let typed = trim(value)
+              let next = typed == "" ? path : typed
+              if next != path {
+                path = next
+                bookmark = max(0, get(marks, next, 0))
+                playing = false
+                endsAt = 0
+                resume = false
+                chunk = floor(bookmark / 600)
+                refresh()
+              }
+              view = "read"
+            }
+          }
+          Row {
+            gap: 8
+            Button {
+              text: "Load file"
+              onTap: {
+                let typed = trim(draft)
+                let next = typed == "" ? path : typed
+                if next != path {
+                  path = next
+                  bookmark = max(0, get(marks, next, 0))
+                  playing = false
+                  endsAt = 0
+                  resume = false
+                  chunk = floor(bookmark / 600)
+                  refresh()
+                }
+                view = "read"
+              }
+            }
+            Button {
+              text: "Read Alice"
+              onTap: {
+                path = ""
+                draft = ""
+                bookmark = max(0, get(marks, "", 0))
+                playing = false
+                endsAt = 0
+                resume = false
+                chunk = floor(bookmark / 600)
+                view = "read"
+                refresh()
+              }
+            }
+          }
+          Text { text: path == "" ? "Reading: Alice's Adventures in Wonderland, Chapter I" : path; style: small; maxLines: 3 }
+          if book.error { Text { text: book.error; color: red; maxLines: 4 } }
+          Text { text: "Enter a Linux file path (.epub, .txt, .text or .md). Position is remembered per file."; style: muted; maxLines: 3 }
+          Button { text: "Text source · Project Gutenberg"; onTap: url("https://www.gutenberg.org/ebooks/11") }
+        }
+      }
+      Row {
+        fill: width; gap: 8; align: center
+        Tab { target: "read"; label: "Read" }
+        Button {
+          text: "Text"
+          color: view == "text" ? accent : null
+          onTap: {
+            let here = playing && ready ? min(limit, origin + floor(max(0, time - started) * wpm / 60)) : bookmark
+            page = clamp(floor((here - chunk * 600) / 240), 0, 2)
+            view = "text"
+          }
+        }
+        Tab { target: "chapters"; label: "Chapters" }
+        Tab { target: "settings"; label: "⚙" }
+        Spacer { weight: 1 }
+        Text { text: "${wpm} wpm"; style: label; color: muted }
+      }
+    }
+  }
+  onTap: { screen() }
+}
